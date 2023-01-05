@@ -48,6 +48,7 @@ int nThread = 4;
 int nShared = 500;      // Particles
 int steps = 100;        // Iterations
 int count;
+int M = 25;
 
 double *sharedBuff;     //Buffers to hold the position of the particles and their mass
 double *localBuff;      //Buffer to hold velocity in x and y, and acceleration in x and y also
@@ -94,13 +95,15 @@ struct Node {
 
 struct Statistics {
     double computTime;
+    double totalComputTime;
     double loadImbalance;
-    int evaluatedParticles;
-    int eliminatedParticles;
-    int simplifications;
+    int evalPart;
+    int deletedPart;
+    int simplPart;
 };
 
 struct Partition {
+    int id;
     int first;
     int last;
     struct Statistics stats;
@@ -144,6 +147,7 @@ void initializeArgs(int argc, char **argv) {
         if (strcasecmp(argv[j], "-N") == 0)nShared = atoi(argv[j + 1]);
         else if (strcasecmp(argv[j], "-I") == 0) steps = atoi(argv[j + 1]);
         else if (strcasecmp(argv[j], "-T") == 0) nThread = atoi(argv[j + 1]);
+        else if (strcasecmp(argv[j], "-M") == 0) M = atoi(argv[j + 1]);
         else if (strcasecmp(argv[j], "-G") == 0) { graphicsEnabled = true; }
         else if (strcasecmp(argv[j], "-F") == 0) {
             inputFile = true;
@@ -363,7 +367,7 @@ void calculateForceNoParam(struct Node *_tree, int index, int *counter) {
         //Now, we know it is not because there is some distance between the Center of Mass and the particle
         //If the node is external (only contains one particle) or is far away enough, we calculate the force with the center of mass
         if (distance > rcutoff || _tree->external) {
-            *counter++;
+            (*counter)++;
             double f;
             if (distance < rlimit) {
                 f = G * _tree->mass / (rlimit * rlimit * distance);
@@ -523,7 +527,7 @@ void calculateForcesThread(struct Partition *attr) {
         for (int s = 0; s < 4; s++) {
             //Recursively calculate accelerations
             if (tree->children[s] != NULL)
-                calculateForceNoParam(tree->children[s], indexes[j], &attr->stats.simplifications);
+                calculateForceNoParam(tree->children[s], indexes[j], &attr->stats.simplPart);
         }
     }
 }
@@ -544,7 +548,7 @@ void kickParticles() {
 
 void checkHelpMode(int argc, char **argv) {
     if (argc <= 1 || strcasecmp(argv[1], "-H") == 0) {
-        printf("Usage: ./%s , -N <Number_of_Bodies> -i, -I <Number_of_iterations> -t, -T <Number_of_Threads> [-f, -F <Path_to_Initial_Galaxy_File>] [-g, -G (set GUI Mode)]",
+        printf("Usage: ./%s , -N <Number_of_Bodies> -i, -I <Number_of_iterations> -t, -T <Number_of_Threads> -M <Statistics_interval> [-f, -F <Path_to_Initial_Galaxy_File>] [-g, -G (set GUI Mode)]",
                argv[0]);
         exit(0);
     }
@@ -596,10 +600,22 @@ double getElapsedTime(struct timespec startTime, struct timespec endTime) {
     return seconds + nseconds / BILLION;
 }
 
+void printPartialStatistics(struct Partition *p) {
+    struct Statistics s = p->stats;
+    int particles = p->last - p->first;
+    printf("Thread %i Statistics Iter %i ## ", p->id, count);
+    printf("Part: %i [%i-%i]    Eval Part: %i   Deleted Part: %i    Mass Simpl: %i  ", particles, p->first, p->last - 1,
+           s.evalPart, s.deletedPart, s.simplPart);
+    printf("Thread Time: %.6f Total Time: %.6f  Average Iter Time: %.6f\n", s.computTime, s.totalComputTime,
+           s.computTime / count);
+}
+
 void threadRoutine(struct Partition *attr) {
     printPrueba("Antes del WHILE en HIJO");
+    struct Statistics *s = &attr->stats;
 
     while (count <= steps) {
+        s->evalPart += attr->last - attr->first;
         printPrueba("Dentro del WHILE en HIJO");
         struct timespec startTime, endTime;
         if (clock_gettime(CLOCK_REALTIME, &startTime) < 0) printError("Error calculate startTime", -1);
@@ -622,7 +638,17 @@ void threadRoutine(struct Partition *attr) {
         printPrueba("Después de la barrera en HIJO");
         sem_wait(&semIter);
         if (clock_gettime(CLOCK_REALTIME, &endTime) < 0) printError("Error calculate endTime", -1);
-        attr->stats.computTime = getElapsedTime(startTime, endTime);
+        s->computTime = getElapsedTime(startTime, endTime);
+        s->totalComputTime += s->computTime;
+        if (count % M == 0) {
+            printPartialStatistics(attr);
+        }
+    }
+}
+
+void sem_post_n(sem_t *sem, int n) {
+    for (int i = 0; i < n; ++i) {
+        sem_post(sem);
     }
 }
 
@@ -652,11 +678,6 @@ void graphicThread(GLFWwindow *window){
 }
 #endif
 
-void sem_post_n(sem_t *sem, int n) {
-    for (int i = 0; i < n; ++i) {
-        sem_post(sem);
-    }
-}
 
 int main(int argc, char *argv[]) {
     checkHelpMode(argc, argv);
@@ -790,7 +811,7 @@ int main(int argc, char *argv[]) {
     //This is the pure algorithm, without visualization
     //system("mkdir res");
 
-    if ((pthread_barrier_init(&barr1, NULL, nThread + 1)) < 0) printError("Error creaating barrier", -1);
+    if ((pthread_barrier_init(&barr1, NULL, nThread + 1)) < 0) printError("Error creating barrier", -1);
 
     sem_init(&semTree, 0, 0);
     sem_init(&semIter, 0, 0);
@@ -800,6 +821,7 @@ int main(int argc, char *argv[]) {
     int firstNonAssigned = 0, currentJob = 0, remainingThreads = nThread, tasks = nLocal;
     //Asignación proporcional
     for (int j = 0; j < nThread; j++) {
+        attrs[j].id = j;
         currentJob = tasks / remainingThreads;
         attrs[j].first = firstNonAssigned;
         attrs[j].last = firstNonAssigned + currentJob;
@@ -820,6 +842,7 @@ int main(int argc, char *argv[]) {
 
         firstNonAssigned = 0, currentJob = 0, remainingThreads = nThread, tasks = nLocal;
         for (int j = 0; j < nThread; j++) {
+            attrs[j].id = j;
             currentJob = tasks / remainingThreads;
             attrs[j].first = firstNonAssigned;
             attrs[j].last = firstNonAssigned + currentJob;
@@ -832,6 +855,7 @@ int main(int argc, char *argv[]) {
         // Barrera
         int ret = pthread_barrier_wait(&barr1);
         if (ret != 0 && ret != PTHREAD_BARRIER_SERIAL_THREAD) {
+            cancelRemainingThreads(0, nThread);
             //Cancelar threads
         }
         printPrueba("Después de la barrera en MAIN\n");
@@ -863,4 +887,5 @@ int main(int argc, char *argv[]) {
     freeMemory();
     return 0;
 }
+
 
