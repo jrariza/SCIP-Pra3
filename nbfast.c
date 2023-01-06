@@ -49,7 +49,7 @@ int steps = 100;        // Iterations
 int count;
 int M = 25;
 
-double threshold = 0.1;
+double threshold = 0.05;
 
 double *sharedBuff;     //Buffers to hold the position of the particles and their mass
 double *localBuff;      //Buffer to hold velocity in x and y, and acceleration in x and y also
@@ -68,7 +68,7 @@ pthread_t *tid;
 
 sem_t semTree, semIter;
 pthread_barrier_t barr1, barr2;
-pthread_mutex_t mutexStats;
+pthread_mutex_t mutexStats, mutexElminated;
 
 
 bool graphicsEnabled = false;
@@ -101,7 +101,7 @@ struct Statistics {
     double totalComputTime;
     double loadImbalance;
     long evalPart;
-    long deletedPart;
+    int deletedPart;
     long simplPart;
 };
 
@@ -109,6 +109,7 @@ struct Partition {
     int id;
     int first;
     int last;
+    int numParts;
     struct Statistics stats;
 };
 
@@ -129,6 +130,7 @@ void freeMemory() {
     sem_destroy(&semTree);
     sem_destroy(&semIter);
     pthread_mutex_destroy(&mutexStats);
+    pthread_mutex_destroy(&mutexElminated);
 }
 
 double getElapsedTime(struct timespec startTime, struct timespec endTime) {
@@ -553,8 +555,7 @@ void calculateForcesThread(struct Partition *attr) {
 
 void kickParticles() {
     for (int i = 0; i < nLocal; i++) {
-        if (sharedBuff[PX(indexes[i])] <= 0 || sharedBuff[PX(indexes[i])] >= 1 || sharedBuff[PY(indexes[i])] <= 0 ||
-            sharedBuff[PY(indexes[i])] >= 1) {
+        if (indexes[i] == -1) {
             nLocal--;
             for (int j = i; j < nLocal; j++) {
                 indexes[j] = indexes[j + 1];
@@ -618,7 +619,7 @@ void printPartialStatistics(struct Partition *p) {
     struct Statistics s = p->stats;
     int particles = p->last - p->first;
     printf("Thread %i Statistics Iter %i ## "
-           "Part: %i [%i-%i]\tEval Part: %li\tDeleted Part: %li\tMass Simpl: %li\t"
+           "Part: %i [%i-%i]\tEval Part: %li\tDeleted Part: %i\tMass Simpl: %li\t"
            "Thread Time: %.6f\tTotal Time: %.6f\tAverage Iter Time: %.6f\n",
            p->id, count,
            particles, p->first, p->last - 1, s.evalPart, s.deletedPart, s.simplPart,
@@ -628,7 +629,7 @@ void printPartialStatistics(struct Partition *p) {
 
 void printGlobalStatistics() {
     printf("Global Statistics Iter %i ## "
-           "Eval Part: %li\tDeleted Part: %li\tMass Simpl: %li\t"
+           "Eval Part: %li\tDeleted Part: %i\tMass Simpl: %li\t"
            "Thread Time: %.6f\tTotal Time: %.6f\tAverage Iter Time: %.6f\n",
            count,
            global.evalPart, global.deletedPart, global.simplPart,
@@ -641,7 +642,7 @@ void addToGlobalStats(struct Statistics *stats) {
     global.evalPart += stats->evalPart;
     global.deletedPart += stats->deletedPart;
     global.simplPart += stats->simplPart;
-//    global.computTime += stats->computTime;
+    global.computTime += stats->computTime;
     global.totalComputTime += stats->totalComputTime;
 //    global.loadImbalance += stats->loadImbalance;
     pthread_mutex_unlock(&mutexStats);
@@ -649,15 +650,21 @@ void addToGlobalStats(struct Statistics *stats) {
 
 void markDeletedParticles(struct Partition *p) {
     int first = p->first, last = p->last;
-    long deleted = 0;
+    int deleted = 0;
     for (int i = first; i < last; i++) {
         if (sharedBuff[PX(indexes[i])] <= 0 || sharedBuff[PX(indexes[i])] >= 1 || sharedBuff[PY(indexes[i])] <= 0 ||
             sharedBuff[PY(indexes[i])] >= 1) {
-            eliminated = true;
+            indexes[i] = -1;
             deleted++;
         }
     }
+    if (!eliminated && deleted > 0) {
+        pthread_mutex_lock(&mutexElminated);
+        eliminated = true;
+        pthread_mutex_unlock(&mutexElminated);
+    }
     p->stats.deletedPart += deleted;
+    p->numParts -= deleted;
 }
 
 void threadRoutine(struct Partition *attr) {
@@ -709,41 +716,48 @@ void sem_post_n(sem_t *sem, int n) {
     }
 }
 
-void loadBalancingHigh(int i) {
-    double imbalanceLeft = 0, imbalanceRight = 0;
+void loadBalancingHigh(int i, double ratio) {
+    double imbalanceRatio = ratio, imbalanceLeft = 0, imbalanceRight = 0;
     printf("Thread %i: Cede partículas\n", i);
-//    int left = i - 1 < 0 ? nThread - 1 : i - 1;
-//    int right = i + 1 >= nThread ? 0 : i + 1;
     int left = i - 1;
     int right = i + 1;
     printf("Thread %i\tLeft: %i\t Right: %i\n", i, left, right);
-    if (i != 0)
-        imbalanceLeft = left < 0 ? 0 : fabs(
-                (attrs[i].stats.computTime - attrs[left].stats.computTime) / attrs[left].stats.computTime);
-    if (i != nThread - 1)
-        imbalanceRight = right >= nThread ? 0 :
-                         fabs((attrs[i].stats.computTime - attrs[right].stats.computTime) /
-                              attrs[right].stats.computTime);
-    int totalParticlesToGive = floor(threshold * (attrs[i].last - attrs[i].first));
-    int toGiveLeft = floor(
-            totalParticlesToGive * (imbalanceLeft / (imbalanceLeft + imbalanceRight)));
-    int toGiveRight = ceil(
-            totalParticlesToGive * (imbalanceRight / (imbalanceLeft + imbalanceRight)));
-    attrs[left].last += toGiveLeft;
-    attrs[i].first += toGiveLeft;
-    attrs[i].last -= toGiveRight;
-    attrs[right].first -= toGiveRight;
+    if (i != 0) {
+        double leftDifference = attrs[i].stats.computTime - attrs[left].stats.computTime;
+        if (leftDifference > 0) imbalanceLeft = leftDifference / attrs[left].stats.computTime;
+    }
+    if (i != nThread - 1) {
+        double rightDifference = attrs[i].stats.computTime - attrs[right].stats.computTime;
+        if (rightDifference > 0) imbalanceRight = rightDifference / attrs[right].stats.computTime;
+    }
+    if (imbalanceLeft == 0 && imbalanceRight == 0) return;
+
+    int particlesToGive = floor((ratio - threshold) * (attrs[i].numParts));
+    int toGiveLeft = floor(particlesToGive * (imbalanceLeft / (imbalanceLeft + imbalanceRight)));
+    int toGiveRight = particlesToGive - toGiveLeft;
+
+    if (i != 0) {
+        attrs[i].first += toGiveLeft;
+        attrs[left].last += toGiveLeft;
+        attrs[left].numParts += toGiveLeft;
+    }
+    if (i != nThread - 1) {
+        attrs[i].last -= toGiveRight;
+        attrs[right].first -= toGiveRight;
+        attrs[right].numParts += toGiveRight;
+    }
+    attrs[i].numParts -= particlesToGive;
     printf("LOAD BALANCING HIGH ## Thread %i: New Interval [%i-%i]\n", i, attrs[i].first, attrs[i].last - 1);
 }
 
-void loadBalancingLow(int i) {
+void loadBalancingLow(int i, double ratio) {
     double imbalanceLeft = 0, imbalanceRight = 0;
     printf("Thread %i: Cede partículas\n", i);
     int left = i - 1;
     int right = i + 1;
     printf("Thread %i\tLeft: %i\t Right: %i\n", i, left, right);
     if (i != 0)
-        imbalanceLeft = left < 0 ? 0 : fabs((attrs[i].stats.computTime - attrs[left].stats.computTime) /
+        imbalanceLeft = fabs((attrs[i].stats.computTime - attrs[left].stats.computTime) /
                                             attrs[left].stats.computTime);
     if (i != nThread - 1)
         imbalanceRight = right >= nThread ? 0 :
@@ -787,6 +801,35 @@ void graphicThread(GLFWwindow *window){
 }
 #endif
 
+
+void reassignParticles() {
+    int firstNonAssigned = 0, currentJob = 0, tasks = nLocal;
+    for (int j = 0; j < nThread; j++) {
+        currentJob = attrs[j].numParts;
+        attrs[j].first = firstNonAssigned;
+        attrs[j].last = firstNonAssigned + currentJob;
+        firstNonAssigned += currentJob;
+        tasks -= currentJob;
+    }
+}
+
+void firstAssignation() {
+    int firstNonAssigned = 0, currentJob = 0, remainingThreads = nThread, tasks = nLocal;
+    for (int j = 0; j < nThread; j++) {
+        attrs[j].id = j;
+        currentJob = tasks / remainingThreads;
+        attrs[j].first = firstNonAssigned;
+        attrs[j].last = firstNonAssigned + currentJob;
+        attrs[j].numParts = attrs[j].last - attrs[j].first;
+        if (pthread_create(&tid[j], NULL, (void *(*)(void *)) threadRoutine, &attrs[j]) != 0) {
+            cancelRemainingThreads(0, j);
+            printError("ERROR CREATE", -3);
+        }
+        firstNonAssigned += currentJob; //Maybe attrs[j].last
+        remainingThreads--;
+        tasks -= currentJob;
+    }
+}
 
 int main(int argc, char *argv[]) {
     checkHelpMode(argc, argv);
@@ -923,32 +966,19 @@ int main(int argc, char *argv[]) {
 
     if ((pthread_barrier_init(&barr1, NULL, nThread + 1)) < 0) printError("Error creating barrier", -1);
     if ((pthread_barrier_init(&barr2, NULL, nThread + 1)) < 0) printError("Error creating barrier", -1);
-
-
     if (sem_init(&semTree, 0, 0) < 0) printError("Error creating semTree", -1);
     if (sem_init(&semIter, 0, 0) < 0) printError("Error creating semIter", -1);
     if (pthread_mutex_init(&mutexStats, NULL) != 0) printError("Error creating mutexStats", -1);
+    if (pthread_mutex_init(&mutexElminated, NULL) != 0) printError("Error creating mutexEliminated", -1);
 
     count = 1;
 
-    int firstNonAssigned = 0, currentJob = 0, remainingThreads = nThread, tasks = nLocal;
     //Asignación proporcional
-    for (int j = 0; j < nThread; j++) {
-        attrs[j].id = j;
-        currentJob = tasks / remainingThreads;
-        attrs[j].first = firstNonAssigned;
-        attrs[j].last = firstNonAssigned + currentJob;
-        if (pthread_create(&tid[j], NULL, (void *(*)(void *)) threadRoutine, &attrs[j]) != 0) {
-            cancelRemainingThreads(0, j);
-            printError("ERROR CREATE", -3);
-        }
-        firstNonAssigned += currentJob; //Maybe attrs[j].last
-        remainingThreads--;
-        tasks -= currentJob;
-    }
+    firstAssignation();
 
 
     while (count <= steps) {
+        memset(&global, 0, sizeof(struct Statistics));
         nShared = nLocal;
         //First we build the tree
         buildTreeConc(tree, indexes, nLocal, nThread);
@@ -965,29 +995,21 @@ int main(int argc, char *argv[]) {
         //To be able to store the positions of the particles
         ShowWritePartialResults(count, nOriginal, nLocal, indexes, sharedBuff, startTime);
 
-        if (eliminated) {
-            firstNonAssigned = 0, currentJob = 0, remainingThreads = nThread, tasks = nLocal;
-            for (int j = 0; j < nThread; j++) {
-                attrs[j].id = j;
-                currentJob = tasks / remainingThreads;
-                attrs[j].first = firstNonAssigned;
-                attrs[j].last = firstNonAssigned + currentJob;
-                firstNonAssigned += currentJob;
-                remainingThreads--;
-                tasks -= currentJob;
-            }
-        }
+        if (eliminated) reassignParticles();
+
         ret = pthread_barrier_wait(&barr1);
         if (ret != 0 && ret != PTHREAD_BARRIER_SERIAL_THREAD) cancelRemainingThreads(0, nThread);
+
         if (count % M == 0) {
             for (int i = 0; i < nThread; ++i) {
-                double imbalance = attrs[i].stats.loadImbalance;
-                printf("Imbalance: %f\n", imbalance);
-                if (imbalance > 0 && fabs(imbalance) > threshold) loadBalancingHigh(i);
-                else if (imbalance < 0 && fabs(imbalance) > threshold)loadBalancingLow(i);
+                double averageTime = global.computTime / nThread;
+                double imbalanceRatio = attrs[i].stats.loadImbalance / averageTime;
+                printf("Thread %i\tImbalance: %f\tImbalance percent: %.4f%%\n", i, attrs[i].stats.loadImbalance,
+                       imbalanceRatio * 100);
+                if (imbalanceRatio > threshold) loadBalancingHigh(i, imbalanceRatio);
+                else if (imbalanceRatio < -threshold)loadBalancingLow(i, -imbalanceRatio);
             }
             printGlobalStatistics();
-            memset(&global, 0, sizeof(struct Statistics));
         }
         //We advance one step
         count++;
