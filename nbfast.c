@@ -10,7 +10,6 @@ X9278777W   Mihaela Alexandra Buturuga
 #include<stdlib.h>
 #include<math.h>
 #include<time.h>
-#include <stdio.h>
 #include<unistd.h>
 #include <string.h>
 #include"pthread.h"
@@ -50,6 +49,8 @@ int steps = 100;        // Iterations
 int count;
 int M = 25;
 
+double threshold = 0.1;
+
 double *sharedBuff;     //Buffers to hold the position of the particles and their mass
 double *localBuff;      //Buffer to hold velocity in x and y, and acceleration in x and y also
 double *radius;
@@ -66,11 +67,13 @@ struct Node *tree;
 pthread_t *tid;
 
 sem_t semTree, semIter;
-pthread_barrier_t barr1;
+pthread_barrier_t barr1, barr2;
+pthread_mutex_t mutexStats;
 
 
 bool graphicsEnabled = false;
 bool inputFile = false;
+bool eliminated = false;
 
 void printPrueba(char *msg) {
     if (DEBUG) fprintf(stderr, "%s\n", msg);
@@ -97,9 +100,9 @@ struct Statistics {
     double computTime;
     double totalComputTime;
     double loadImbalance;
-    int evalPart;
-    int deletedPart;
-    int simplPart;
+    long evalPart;
+    long deletedPart;
+    long simplPart;
 };
 
 struct Partition {
@@ -111,7 +114,7 @@ struct Partition {
 
 
 struct Partition *attrs;
-struct Statistics *st;
+struct Statistics global;
 
 void freeMemory() {
     free(attrs);
@@ -120,6 +123,18 @@ void freeMemory() {
     free(localBuff);
     free(indexes);
     free(radius);
+
+    pthread_barrier_destroy(&barr1);
+    pthread_barrier_destroy(&barr2);
+    sem_destroy(&semTree);
+    sem_destroy(&semIter);
+    pthread_mutex_destroy(&mutexStats);
+}
+
+double getElapsedTime(struct timespec startTime, struct timespec endTime) {
+    double seconds = (double) (endTime.tv_sec - startTime.tv_sec);
+    double nseconds = (double) (endTime.tv_nsec - startTime.tv_nsec);
+    return seconds + nseconds / BILLION;
 }
 
 void printError(const char *msg, int status) {
@@ -144,7 +159,7 @@ struct BuildTreeJob {
 
 void initializeArgs(int argc, char **argv) {
     for (int j = 0; j < argc; ++j) {
-        if (strcasecmp(argv[j], "-N") == 0)nShared = atoi(argv[j + 1]);
+        if (strcasecmp(argv[j], "-N") == 0) nShared = atoi(argv[j + 1]);
         else if (strcasecmp(argv[j], "-I") == 0) steps = atoi(argv[j + 1]);
         else if (strcasecmp(argv[j], "-T") == 0) nThread = atoi(argv[j + 1]);
         else if (strcasecmp(argv[j], "-M") == 0) M = atoi(argv[j + 1]);
@@ -358,7 +373,7 @@ void buildTreeConc(struct Node *node, int *indexes, int n, int numThreads) {
 
 }
 
-void calculateForceNoParam(struct Node *_tree, int index, int *counter) {
+void calculateForceNoParam(struct Node *_tree, int index, long *eval, long *simpl) {
     double distanceX = _tree->CMX - sharedBuff[PX(index)];
     double distanceY = _tree->CMY - sharedBuff[PY(index)];
     double distance = sqrt(distanceX * distanceX + distanceY * distanceY);
@@ -367,11 +382,12 @@ void calculateForceNoParam(struct Node *_tree, int index, int *counter) {
         //Now, we know it is not because there is some distance between the Center of Mass and the particle
         //If the node is external (only contains one particle) or is far away enough, we calculate the force with the center of mass
         if (distance > rcutoff || _tree->external) {
-            (*counter)++;
             double f;
             if (distance < rlimit) {
+                (*eval)++;
                 f = G * _tree->mass / (rlimit * rlimit * distance);
             } else {
+                (*simpl)++;
                 f = G * _tree->mass / (distance * distance * distance);
             }
             localBuff[AX(index)] += f * distanceX;
@@ -380,7 +396,7 @@ void calculateForceNoParam(struct Node *_tree, int index, int *counter) {
             //If not, we recursively call the calculateForce() function in the children that are not empty.
             for (int s = 0; s < 4; s++) {
                 if (_tree->children[s] != NULL) {
-                    calculateForceNoParam(_tree->children[s], index, counter);
+                    calculateForceNoParam(_tree->children[s], index, eval, simpl);
                 }
             }
         }
@@ -497,18 +513,21 @@ void ReadGalaxyFileOptimized(char *_filename) {
 #define DShowStatistics 1
 #define DIntervalStatistics 1
 
-clock_t StartTime, EndTime;
 double TimeSpent;
 
-void ShowWritePartialResults(int count, int _nOriginal, int _nShared, int *_indexes, double *_sharedBuff) {
+void ShowWritePartialResults(int count, int _nOriginal, int _nShared, int *_indexes, double *_sharedBuff,
+                             struct timespec start) {
 //    if (DSaveIntermediateState && !(count % DIntervalIntermediateState))
 //        SaveGalaxy(count, _nOriginal, _indexes, _sharedBuff);
 
     if (DShowStatistics && !(count % DIntervalStatistics)) {
         int j = 0;
-        clock_t CurrentTime;
-        CurrentTime = clock();
-        TimeSpent = (double) (CurrentTime - StartTime) / CLOCKS_PER_SEC;
+        struct timespec endTime;
+        if (clock_gettime(CLOCK_REALTIME, &endTime) < 0) printError("Error calculate program partial endTime", -1);
+//        CurrentTime = clock();
+//        TimeSpent = (double) (CurrentTime - StartTime) / CLOCKS_PER_SEC;
+        TimeSpent = getElapsedTime(start, endTime);
+
         //Mins = (int)TimeSpent/60;
         //Secs = (TimeSpent-(Mins*60));
         printf("[%.3f] Iteration %d => %d Bodies (%d) \t(Body %d: (%le, %le) %le).\n", TimeSpent, count, _nShared,
@@ -527,7 +546,7 @@ void calculateForcesThread(struct Partition *attr) {
         for (int s = 0; s < 4; s++) {
             //Recursively calculate accelerations
             if (tree->children[s] != NULL)
-                calculateForceNoParam(tree->children[s], indexes[j], &attr->stats.simplPart);
+                calculateForceNoParam(tree->children[s], indexes[j], &attr->stats.evalPart, &attr->stats.simplPart);
         }
     }
 }
@@ -589,59 +608,97 @@ void initializeRandomParticles() {
 
 void printInputArgs(int part, int iter, int th, char *file) {
     printf("------------NBody With------------\n");
-    printf("- Particles: %d\n- Iterations: %d\n- Threads: %d\n", part, iter, th);
+    printf("- Particles: %d\n- Iterations: %d\n- Threads: %d\n- Statistics Interval: %d\n", part, iter, th, M);
     if (inputFile) printf("- File: %s\n", file);
     printf("----------------------------------\n");
 }
 
-double getElapsedTime(struct timespec startTime, struct timespec endTime) {
-    double seconds = (double) (endTime.tv_sec - startTime.tv_sec);
-    double nseconds = (double) (endTime.tv_nsec - startTime.tv_nsec);
-    return seconds + nseconds / BILLION;
-}
 
 void printPartialStatistics(struct Partition *p) {
     struct Statistics s = p->stats;
     int particles = p->last - p->first;
-    printf("Thread %i Statistics Iter %i ## ", p->id, count);
-    printf("Part: %i [%i-%i]    Eval Part: %i   Deleted Part: %i    Mass Simpl: %i  ", particles, p->first, p->last - 1,
-           s.evalPart, s.deletedPart, s.simplPart);
-    printf("Thread Time: %.6f Total Time: %.6f  Average Iter Time: %.6f\n", s.computTime, s.totalComputTime,
-           s.computTime / count);
+    printf("Thread %i Statistics Iter %i ## "
+           "Part: %i [%i-%i]\tEval Part: %li\tDeleted Part: %li\tMass Simpl: %li\t"
+           "Thread Time: %.6f\tTotal Time: %.6f\tAverage Iter Time: %.6f\n",
+           p->id, count,
+           particles, p->first, p->last - 1, s.evalPart, s.deletedPart, s.simplPart,
+           s.computTime, s.totalComputTime, s.computTime / count
+    );
+}
+
+void printGlobalStatistics() {
+    printf("Global Statistics Iter %i ## "
+           "Eval Part: %li\tDeleted Part: %li\tMass Simpl: %li\t"
+           "Thread Time: %.6f\tTotal Time: %.6f\tAverage Iter Time: %.6f\n",
+           count,
+           global.evalPart, global.deletedPart, global.simplPart,
+           global.computTime, global.totalComputTime, global.computTime / count
+    );
+}
+
+void addToGlobalStats(struct Statistics *stats) {
+    pthread_mutex_lock(&mutexStats);
+    global.evalPart += stats->evalPart;
+    global.deletedPart += stats->deletedPart;
+    global.simplPart += stats->simplPart;
+//    global.computTime += stats->computTime;
+    global.totalComputTime += stats->totalComputTime;
+//    global.loadImbalance += stats->loadImbalance;
+    pthread_mutex_unlock(&mutexStats);
+}
+
+void markDeletedParticles(struct Partition *p) {
+    int first = p->first, last = p->last;
+    long deleted = 0;
+    for (int i = first; i < last; i++) {
+        if (sharedBuff[PX(indexes[i])] <= 0 || sharedBuff[PX(indexes[i])] >= 1 || sharedBuff[PY(indexes[i])] <= 0 ||
+            sharedBuff[PY(indexes[i])] >= 1) {
+            eliminated = true;
+            deleted++;
+        }
+    }
+    p->stats.deletedPart += deleted;
 }
 
 void threadRoutine(struct Partition *attr) {
     printPrueba("Antes del WHILE en HIJO");
     struct Statistics *s = &attr->stats;
-
     while (count <= steps) {
-        s->evalPart += attr->last - attr->first;
-        printPrueba("Dentro del WHILE en HIJO");
         struct timespec startTime, endTime;
-        if (clock_gettime(CLOCK_REALTIME, &startTime) < 0) printError("Error calculate startTime", -1);
-
-        printPrueba("Antes del semáforo en HIJO");
         // Semáforo para esperar a la creación del árbol
         sem_wait(&semTree);
 
-        printPrueba("Después del semáforo en HIJO");
-        // Fuerzas
+        //Empieza a contar
+        if (clock_gettime(CLOCK_REALTIME, &startTime) < 0) printError("Error calculate startTime", -1);
+
         calculateForcesThread(attr);
-        // Mover partículas
         moveParticleNoParam(attr);
-        // Barrera para hacer kick después
-        int ret = pthread_barrier_wait(&barr1);
+        markDeletedParticles(attr);
+
+        //Acaba de contar
+        if (clock_gettime(CLOCK_REALTIME, &endTime) < 0) printError("Error calculate endTime", -1);
+        s->computTime += getElapsedTime(startTime, endTime);
+        if (count % M == 0) {
+            s->totalComputTime += s->computTime;
+            addToGlobalStats(&attr->stats);
+        }
+        int ret = pthread_barrier_wait(&barr2);
         if (ret != 0 && ret != PTHREAD_BARRIER_SERIAL_THREAD) {
             //Cancelar threads
         }
-
-        printPrueba("Después de la barrera en HIJO");
+        double averageBalance = global.computTime / nThread;
+        s->loadImbalance = s->computTime - averageBalance;
+        pthread_mutex_lock(&mutexStats);
+        global.loadImbalance += s->loadImbalance;
+        pthread_mutex_unlock(&mutexStats);
+        if (count % M == 0) printPartialStatistics(attr);
+        ret = pthread_barrier_wait(&barr1);
+        if (ret != 0 && ret != PTHREAD_BARRIER_SERIAL_THREAD) {
+            //Cancelar threads
+        }
         sem_wait(&semIter);
-        if (clock_gettime(CLOCK_REALTIME, &endTime) < 0) printError("Error calculate endTime", -1);
-        s->computTime = getElapsedTime(startTime, endTime);
-        s->totalComputTime += s->computTime;
         if (count % M == 0) {
-            printPartialStatistics(attr);
+            s->computTime = 0;
         }
     }
 }
@@ -650,6 +707,58 @@ void sem_post_n(sem_t *sem, int n) {
     for (int i = 0; i < n; ++i) {
         sem_post(sem);
     }
+}
+
+void loadBalancingHigh(int i) {
+    double imbalanceLeft = 0, imbalanceRight = 0;
+    printf("Thread %i: Cede partículas\n", i);
+//    int left = i - 1 < 0 ? nThread - 1 : i - 1;
+//    int right = i + 1 >= nThread ? 0 : i + 1;
+    int left = i - 1;
+    int right = i + 1;
+    printf("Thread %i\tLeft: %i\t Right: %i\n", i, left, right);
+    if (i != 0)
+        imbalanceLeft = left < 0 ? 0 : fabs(
+                (attrs[i].stats.computTime - attrs[left].stats.computTime) / attrs[left].stats.computTime);
+    if (i != nThread - 1)
+        imbalanceRight = right >= nThread ? 0 :
+                         fabs((attrs[i].stats.computTime - attrs[right].stats.computTime) /
+                              attrs[right].stats.computTime);
+    int totalParticlesToGive = floor(threshold * (attrs[i].last - attrs[i].first));
+    int toGiveLeft = floor(
+            totalParticlesToGive * (imbalanceLeft / (imbalanceLeft + imbalanceRight)));
+    int toGiveRight = ceil(
+            totalParticlesToGive * (imbalanceRight / (imbalanceLeft + imbalanceRight)));
+    attrs[left].last += toGiveLeft;
+    attrs[i].first += toGiveLeft;
+    attrs[i].last -= toGiveRight;
+    attrs[right].first -= toGiveRight;
+    printf("LOAD BALANCING HIGH ## Thread %i: New Interval [%i-%i]\n", i, attrs[i].first, attrs[i].last - 1);
+}
+
+void loadBalancingLow(int i) {
+    double imbalanceLeft = 0, imbalanceRight = 0;
+    printf("Thread %i: Cede partículas\n", i);
+    int left = i - 1;
+    int right = i + 1;
+    printf("Thread %i\tLeft: %i\t Right: %i\n", i, left, right);
+    if (i != 0)
+        imbalanceLeft = left < 0 ? 0 : fabs((attrs[i].stats.computTime - attrs[left].stats.computTime) /
+                                            attrs[left].stats.computTime);
+    if (i != nThread - 1)
+        imbalanceRight = right >= nThread ? 0 :
+                         fabs((attrs[i].stats.computTime - attrs[right].stats.computTime) /
+                              attrs[right].stats.computTime);
+    int totalParticlesToGet = floor(threshold * (attrs[i].last - attrs[i].first));
+    int toGetLeft = floor(
+            totalParticlesToGet * (imbalanceLeft / (imbalanceLeft + imbalanceRight)));
+    int toGetRight = ceil(
+            totalParticlesToGet * (imbalanceRight / (imbalanceLeft + imbalanceRight)));
+    attrs[left].last -= toGetLeft;
+    attrs[i].first -= toGetLeft;
+    attrs[i].last += toGetRight;
+    attrs[right].first += toGetRight;
+    printf("LOAD BALANCING LOW ## Thread %i: New Interval [%i-%i]\n", i, attrs[i].first, attrs[i].last - 1);
 }
 
 
@@ -681,7 +790,8 @@ void graphicThread(GLFWwindow *window){
 
 int main(int argc, char *argv[]) {
     checkHelpMode(argc, argv);
-    StartTime = clock();
+    struct timespec startTime, endTime;
+    if (clock_gettime(CLOCK_REALTIME, &startTime) < 0) printError("Error calculate program startTime", -1);
 
     // Overwrite default values if they are passed as arguments.
     initializeArgs(argc, argv);
@@ -812,9 +922,12 @@ int main(int argc, char *argv[]) {
     //system("mkdir res");
 
     if ((pthread_barrier_init(&barr1, NULL, nThread + 1)) < 0) printError("Error creating barrier", -1);
+    if ((pthread_barrier_init(&barr2, NULL, nThread + 1)) < 0) printError("Error creating barrier", -1);
 
-    sem_init(&semTree, 0, 0);
-    sem_init(&semIter, 0, 0);
+
+    if (sem_init(&semTree, 0, 0) < 0) printError("Error creating semTree", -1);
+    if (sem_init(&semIter, 0, 0) < 0) printError("Error creating semIter", -1);
+    if (pthread_mutex_init(&mutexStats, NULL) != 0) printError("Error creating mutexStats", -1);
 
     count = 1;
 
@@ -839,49 +952,58 @@ int main(int argc, char *argv[]) {
         nShared = nLocal;
         //First we build the tree
         buildTreeConc(tree, indexes, nLocal, nThread);
-
-        firstNonAssigned = 0, currentJob = 0, remainingThreads = nThread, tasks = nLocal;
-        for (int j = 0; j < nThread; j++) {
-            attrs[j].id = j;
-            currentJob = tasks / remainingThreads;
-            attrs[j].first = firstNonAssigned;
-            attrs[j].last = firstNonAssigned + currentJob;
-            firstNonAssigned += currentJob; //Maybe attrs[j].last
-            remainingThreads--;
-            tasks -= currentJob;
-        }
         sem_post_n(&semTree, nThread);
         printPrueba("Después del semáforo en MAIN");
         // Barrera
-        int ret = pthread_barrier_wait(&barr1);
-        if (ret != 0 && ret != PTHREAD_BARRIER_SERIAL_THREAD) {
-            cancelRemainingThreads(0, nThread);
-            //Cancelar threads
-        }
+        int ret = pthread_barrier_wait(&barr2);
+        if (ret != 0 && ret != PTHREAD_BARRIER_SERIAL_THREAD) cancelRemainingThreads(0, nThread);
         printPrueba("Después de la barrera en MAIN\n");
 
         // Kick out particle if it went out of the box (0,1)x(0,1)
-        kickParticles();
+        if (eliminated) kickParticles();
 
         //To be able to store the positions of the particles
-        ShowWritePartialResults(count, nOriginal, nLocal, indexes, sharedBuff);
+        ShowWritePartialResults(count, nOriginal, nLocal, indexes, sharedBuff, startTime);
+
+        if (eliminated) {
+            firstNonAssigned = 0, currentJob = 0, remainingThreads = nThread, tasks = nLocal;
+            for (int j = 0; j < nThread; j++) {
+                attrs[j].id = j;
+                currentJob = tasks / remainingThreads;
+                attrs[j].first = firstNonAssigned;
+                attrs[j].last = firstNonAssigned + currentJob;
+                firstNonAssigned += currentJob;
+                remainingThreads--;
+                tasks -= currentJob;
+            }
+        }
+        ret = pthread_barrier_wait(&barr1);
+        if (ret != 0 && ret != PTHREAD_BARRIER_SERIAL_THREAD) cancelRemainingThreads(0, nThread);
+        if (count % M == 0) {
+            for (int i = 0; i < nThread; ++i) {
+                double imbalance = attrs[i].stats.loadImbalance;
+                printf("Imbalance: %f\n", imbalance);
+                if (imbalance > 0 && fabs(imbalance) > threshold) loadBalancingHigh(i);
+                else if (imbalance < 0 && fabs(imbalance) > threshold)loadBalancingLow(i);
+            }
+            printGlobalStatistics();
+            memset(&global, 0, sizeof(struct Statistics));
+        }
         //We advance one step
         count++;
+        eliminated = false;
         sem_post_n(&semIter, nThread);
         printPrueba("Fin iteración en MAIN");
     }
+
 #ifdef D_GLFW_SUPPORT
     }
 #endif
-
-    pthread_barrier_destroy(&barr1);
-    sem_destroy(&semTree);
-    sem_destroy(&semIter);
-    EndTime = clock();
-    TimeSpent = (double) (EndTime - StartTime) / CLOCKS_PER_SEC;
+    if (clock_gettime(CLOCK_REALTIME, &endTime) < 0) printError("Error calculate program endTime", -1);
+    TimeSpent = getElapsedTime(startTime, endTime);
     printf("NBody Simulation took %.3f seconds.\n", TimeSpent);
 
-    // Save final state.
+// Save final state.
     sprintf(filename, "./res/galaxy_%dB_%di_final.out", nOriginal, count - 1);
     SaveGalaxyFile(filename, nLocal, indexes, sharedBuff);
     freeMemory();
