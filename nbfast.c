@@ -724,18 +724,22 @@ void loadBalancingGive(int i, double ratio, bool *done) {
     int right = i + 1;
     if (i != 0) {
         double leftDifference = attrs[i].stats.computTime - attrs[left].stats.computTime;
-        if (leftDifference > 0) imbalanceLeft = leftDifference / attrs[left].stats.computTime;
+        if (leftDifference > 0) imbalanceLeft = leftDifference / attrs[i].stats.computTime;
     }
     if (i != nThread - 1) {
         double rightDifference = attrs[i].stats.computTime - attrs[right].stats.computTime;
-        if (rightDifference > 0) imbalanceRight = rightDifference / attrs[right].stats.computTime;
+        if (rightDifference > 0) imbalanceRight = rightDifference / attrs[i].stats.computTime;
     }
     if (imbalanceLeft == 0 && imbalanceRight == 0) return;
-    *done = true;
 
     int particlesToGive = floor((ratio) * (attrs[i].numParts));
     int toGiveLeft = floor(particlesToGive * (imbalanceLeft / (imbalanceLeft + imbalanceRight)));
     int toGiveRight = particlesToGive - toGiveLeft;
+
+    if (toGiveLeft + toGiveRight >= attrs[i].numParts) return;
+
+    if (toGiveLeft == 0 && toGiveRight == 0) return;
+    *done = true;
 
     printf("%s""Thread %i LoadBalancing GIVE Iter %i ## "
            "Part: %i [%i-%i]\tUnbalance: %.2f%%\t"
@@ -757,7 +761,7 @@ void loadBalancingGive(int i, double ratio, bool *done) {
         attrs[right].first -= toGiveRight;
         attrs[right].numParts += toGiveRight;
     }
-    attrs[i].numParts -= particlesToGive;
+    attrs[i].numParts -= toGiveLeft + toGiveRight;
     printf("New Part: %i [%i-%i]\n%s", attrs[i].numParts, attrs[i].first, attrs[i].last - 1, RESET);
 
 }
@@ -775,11 +779,17 @@ void loadBalancingTake(int i, double ratio, bool *done) {
         if (rightDifference > 0) imbalanceRight = rightDifference / attrs[right].stats.computTime;
     }
     if (imbalanceLeft == 0 && imbalanceRight == 0) return;
-    *done = true;
 
     int particlesToTake = floor((ratio) * (attrs[i].numParts));
     int toTakeLeft = floor(particlesToTake * (imbalanceLeft / (imbalanceLeft + imbalanceRight)));
     int toTakeRight = particlesToTake - toTakeLeft;
+
+    if (toTakeLeft >= attrs[left].numParts) toTakeLeft = 0;
+    if (toTakeRight >= attrs[right].numParts) toTakeRight = 0;
+    if (toTakeLeft == 0 && toTakeRight == 0) return;
+
+    *done = true;
+
 
     printf("%sThread %i LoadBalancing TAKE Iter %i ## "
            "Part: %i [%i-%i]\tUnbalance: %.2f%%\t"
@@ -801,7 +811,7 @@ void loadBalancingTake(int i, double ratio, bool *done) {
         attrs[right].first += toTakeRight;
         attrs[right].numParts -= toTakeRight;
     }
-    attrs[i].numParts += particlesToTake;
+    attrs[i].numParts += toTakeLeft + toTakeRight;
     printf("New Part: %i [%i-%i]\n%s", attrs[i].numParts, attrs[i].first, attrs[i].last - 1, RESET);
 
 }
@@ -1039,11 +1049,11 @@ int main(int argc, char *argv[]) {
                 double imbalanceRatio = attrs[i].stats.loadImbalance / averageTime;
                 printf("Thread %i\tImbalance: %f\tImbalance percent: %.4f%%\n", i, attrs[i].stats.loadImbalance,
                        imbalanceRatio * 100);
-                if (!lastDidGive && imbalanceRatio < -threshold) {
-                    loadBalancingTake(i, -imbalanceRatio, &iDidTake);
-                }
-                if (!lastDidTake && imbalanceRatio > threshold) {
+                if (!lastDidTake && imbalanceRatio > threshold && attrs[i].numParts > 1) {
                     loadBalancingGive(i, imbalanceRatio, &iDidGive);
+                }
+                if (!lastDidGive && imbalanceRatio < -threshold && attrs[i].numParts > 1) {
+                    loadBalancingTake(i, -imbalanceRatio, &iDidTake);
                 }
                 lastDidGive = iDidGive;
                 lastDidTake = iDidTake;
