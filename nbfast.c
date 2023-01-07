@@ -625,7 +625,7 @@ void printPartialStatistics(struct Partition *p) {
            "Thread Time: %.6f\tTotal Time: %.6f\tAverage Iter Time: %.6f\n%s",
            GREEN, p->id, count,
            particles, p->first, p->last - 1, s.evalPart, s.deletedPart, s.simplPart,
-           s.computTime, s.totalComputTime, s.computTime / count, RESET
+           s.computTime, s.totalComputTime, s.totalComputTime / count, RESET
     );
 }
 
@@ -635,7 +635,7 @@ void printGlobalStatistics() {
            "Thread Time: %.6f\tTotal Time: %.6f\tAverage Iter Time: %.6f\n%s",
            MAGENTA, count,
            global.evalPart, global.deletedPart, global.simplPart,
-           global.computTime, global.totalComputTime, global.computTime / count, RESET
+           global.computTime, global.totalComputTime, global.totalComputTime / count, RESET
     );
 }
 
@@ -724,11 +724,12 @@ void loadBalancingGive(int i, double ratio, bool *done) {
     int right = i + 1;
     if (i != 0) {
         double leftDifference = attrs[i].stats.computTime - attrs[left].stats.computTime;
-        if (leftDifference > 0) imbalanceLeft = leftDifference / attrs[i].stats.computTime;
+        if (leftDifference > 0) imbalanceLeft = leftDifference /
+                                                fabs((attrs[i].stats.computTime + attrs[left].stats.computTime) / 2);
     }
     if (i != nThread - 1) {
         double rightDifference = attrs[i].stats.computTime - attrs[right].stats.computTime;
-        if (rightDifference > 0) imbalanceRight = rightDifference / attrs[i].stats.computTime;
+        if (rightDifference > 0) imbalanceRight = rightDifference / fabs((attrs[i].stats.computTime + attrs[right].stats.computTime) / 2);
     }
     if (imbalanceLeft == 0 && imbalanceRight == 0) return;
 
@@ -855,7 +856,7 @@ void reassignParticles() {
 }
 
 void firstAssignation() {
-    int firstNonAssigned = 0, currentJob = 0, remainingThreads = nThread, tasks = nLocal;
+    int firstNonAssigned = 0, currentJob = 0, remainingThreads = nThread, tasks = nShared;
     for (int j = 0; j < nThread; j++) {
         attrs[j].id = j;
         currentJob = tasks / remainingThreads;
@@ -1019,16 +1020,14 @@ int main(int argc, char *argv[]) {
 
 
     while (count <= steps) {
-        memset(&global, 0, sizeof(struct Statistics));
+        memset(&global, 0, sizeof(global));
         nShared = nLocal;
         //First we build the tree
         buildTreeConc(tree, indexes, nLocal, nThread);
         sem_post_n(&semTree, nThread);
-        printPrueba("Después del semáforo en MAIN");
         // Barrera
         int ret = pthread_barrier_wait(&barr2);
         if (ret != 0 && ret != PTHREAD_BARRIER_SERIAL_THREAD) cancelRemainingThreads(0, nThread);
-        printPrueba("Después de la barrera en MAIN\n");
 
         // Kick out particle if it went out of the box (0,1)x(0,1)
         if (eliminated) kickParticles();
@@ -1049,12 +1048,10 @@ int main(int argc, char *argv[]) {
                 double imbalanceRatio = attrs[i].stats.loadImbalance / averageTime;
                 printf("Thread %i\tImbalance: %f\tImbalance percent: %.4f%%\n", i, attrs[i].stats.loadImbalance,
                        imbalanceRatio * 100);
-                if (!lastDidTake && imbalanceRatio > threshold && attrs[i].numParts > 1) {
+                if (!lastDidTake && imbalanceRatio > threshold && attrs[i].numParts > 1)
                     loadBalancingGive(i, imbalanceRatio, &iDidGive);
-                }
-                if (!lastDidGive && imbalanceRatio < -threshold && attrs[i].numParts > 1) {
-                    loadBalancingTake(i, -imbalanceRatio, &iDidTake);
-                }
+                else if (!lastDidGive && imbalanceRatio < -threshold) loadBalancingTake(i, -imbalanceRatio, &iDidTake);
+
                 lastDidGive = iDidGive;
                 lastDidTake = iDidTake;
                 iDidGive = false;
@@ -1067,12 +1064,17 @@ int main(int argc, char *argv[]) {
         count++;
         eliminated = false;
         sem_post_n(&semIter, nThread);
-        printPrueba("Fin iteración en MAIN");
     }
 
 #ifdef D_GLFW_SUPPORT
     }
 #endif
+    for (int i = 0; i < nThread; ++i) {
+        if (pthread_join(tid[i], NULL) != 0) {
+            cancelRemainingThreads(i, nThread);
+            printError("Error Join", -1);
+        }
+    }
     if (clock_gettime(CLOCK_REALTIME, &endTime) < 0) printError("Error calculate program endTime", -1);
     TimeSpent = getElapsedTime(startTime, endTime);
     printf("NBody Simulation took %.3f seconds.\n", TimeSpent);
