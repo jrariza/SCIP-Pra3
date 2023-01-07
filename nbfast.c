@@ -16,7 +16,6 @@ X9278777W   Mihaela Alexandra Buturuga
 #include "stdbool.h"
 #include "semaphore.h"
 #include "colors.h"
-#include <signal.h>
 
 #ifdef D_GLFW_SUPPORT
 #include<GLFW/glfw3.h>
@@ -36,6 +35,8 @@ X9278777W   Mihaela Alexandra Buturuga
 #define HEIGHT 2000
 
 #define BILLION 1000000000L
+
+#define DEBUG 0
 
 double G = 0.0001;
 double dt = 0.005;
@@ -65,10 +66,9 @@ char filename[100];
 struct Node *tree;
 
 pthread_t *tid;
-pthread_t tid_graphic;
 
 sem_t semTree, semIter;
-pthread_barrier_t barr, barrGraphic;
+pthread_barrier_t barr1, barr;
 pthread_mutex_t mutexStats, mutexElminated;
 pthread_cond_t varCond;
 
@@ -77,7 +77,10 @@ bool graphicsEnabled = false;
 bool inputFile = false;
 bool eliminated = false;
 int printed = 0;
-double totalImbalance = 0;
+
+void printPrueba(char *msg) {
+    if (DEBUG) fprintf(stderr, "%s\n", msg);
+}
 
 struct Node {
     struct Node *children[4];   //Quaternary Tree
@@ -125,7 +128,7 @@ void freeMemory() {
     free(indexes);
     free(radius);
 
-    if (graphicsEnabled) pthread_barrier_destroy(&barrGraphic);
+    pthread_barrier_destroy(&barr1);
     pthread_barrier_destroy(&barr);
     sem_destroy(&semTree);
     sem_destroy(&semIter);
@@ -137,17 +140,6 @@ double getElapsedTime(struct timespec startTime, struct timespec endTime) {
     double seconds = (double) (endTime.tv_sec - startTime.tv_sec);
     double nseconds = (double) (endTime.tv_nsec - startTime.tv_nsec);
     return seconds + nseconds / BILLION;
-}
-
-void stopThread(pthread_t *td) {
-    *td = -1;
-    kill(getppid(), SIGUSR1);
-    exit(-1);
-}
-
-void printErrorThread(const char *msg, pthread_t *td) {
-    fprintf(stderr, "%s\n", msg);
-    stopThread(td);
 }
 
 void printError(const char *msg, int status) {
@@ -176,7 +168,7 @@ void initializeArgs(int argc, char **argv) {
         else if (strcasecmp(argv[j], "-I") == 0) steps = atoi(argv[j + 1]);
         else if (strcasecmp(argv[j], "-T") == 0) nThread = atoi(argv[j + 1]);
         else if (strcasecmp(argv[j], "-M") == 0) M = atoi(argv[j + 1]);
-        else if (strcasecmp(argv[j], "-G") == 0) graphicsEnabled = true;
+        else if (strcasecmp(argv[j], "-G") == 0) { graphicsEnabled = true; }
         else if (strcasecmp(argv[j], "-F") == 0) {
             inputFile = true;
             strcpy(filename, argv[j + 1]);
@@ -430,28 +422,28 @@ void moveParticleNoParam(struct Partition *p) {
 }
 
 #ifdef D_GLFW_SUPPORT
-void drawParticle(double *shrdBuff, double *radius, int index) {
+void drawParticle(double *shrdBuff, double *radius, int index){
     glBegin(GL_TRIANGLE_FAN);
     int k;
-    glVertex2f(shrdBuff[PX(index)], shrdBuff[PY(index)]);
-    for (k = 0; k < 20; k++) {
-        float angle = (float) (k) / 19 * 2 * 3.141592;
-        glVertex2f(shrdBuff[PX(index)] + radius[index] * cos(angle), shrdBuff[PY(index)] + radius[index] * sin(angle));
+    glVertex2f(shrdBuff[PX(index)],shrdBuff[PY(index)]);
+    for(k=0;k<20;k++){
+        float angle=(float) (k)/19*2*3.141592;
+        glVertex2f(shrdBuff[PX(index)]+radius[index]*cos(angle),shrdBuff[PY(index)]+radius[index]*sin(angle));
     }
     glEnd();
 }
 
-void drawBarnesHutDivisions(struct Node *rootNode) {
-    if (!rootNode->external) {
+void drawBarnesHutDivisions(struct Node *rootNode){
+    if(!rootNode->external){
         glBegin(GL_LINES);
-        glVertex2f(rootNode->GCX, rootNode->LLY);
-        glVertex2f(rootNode->GCX, rootNode->TRY);
-        glVertex2f(rootNode->LLX, rootNode->GCY);
-        glVertex2f(rootNode->TRX, rootNode->GCY);
+        glVertex2f(rootNode->GCX,rootNode->LLY);
+        glVertex2f(rootNode->GCX,rootNode->TRY);
+        glVertex2f(rootNode->LLX,rootNode->GCY);
+        glVertex2f(rootNode->TRX,rootNode->GCY);
         glEnd();
         int i;
-        for (i = 0; i < 4; i++) {
-            if (rootNode->children[i] != NULL) {
+        for(i=0;i<4;i++){
+            if(rootNode->children[i]!=NULL){
                 drawBarnesHutDivisions(rootNode->children[i]);
             }
         }
@@ -641,12 +633,10 @@ void printPartialStatistics(struct Partition *p) {
 void printGlobalStatistics() {
     printf("%sGlobal Stats Iter %i ## "
            "Eval Part: %li\tDeleted Part: %i\tMass Simpl: %li\t"
-           "Thread Time: %.6f\tTotal Time: %.6f\tAverage Iter Time: %.6f\t"
-           "Iter Unbalance: %.3f%%\tTotal Unbalance: %.3f%%\n%s",
+           "Thread Time: %.6f\tTotal Time: %.6f\tAverage Iter Time: %.6f\n%s",
            MAGENTA, count,
            global.evalPart, global.deletedPart, global.simplPart,
-           global.computTime, global.totalComputTime, global.totalComputTime / count,
-           global.loadImbalance * 100, totalImbalance * 100, RESET
+           global.computTime, global.totalComputTime, global.totalComputTime / count, RESET
     );
 }
 
@@ -657,6 +647,7 @@ void addToGlobalStats(struct Statistics *stats) {
     global.simplPart += stats->simplPart;
     global.computTime += stats->computTime;
     global.totalComputTime += stats->totalComputTime;
+    global.loadImbalance += stats->loadImbalance;
     pthread_mutex_unlock(&mutexStats);
 }
 
@@ -680,72 +671,51 @@ void markDeletedParticles(struct Partition *p) {
 }
 
 void threadRoutine(struct Partition *attr) {
+    printPrueba("Antes del WHILE en HIJO");
     struct Statistics *s = &attr->stats;
     while (count <= steps) {
         struct timespec startTime, endTime;
-
         // Semáforo para esperar a la creación del árbol
-        if (sem_wait(&semTree) < 0) printErrorThread("Error semTree Thread", &tid[attr->id]);;
+        sem_wait(&semTree);
 
         //Empieza a contar
-        if (clock_gettime(CLOCK_REALTIME, &startTime) < 0)
-            printErrorThread("Error calculate startTime", &tid[attr->id]);
+        if (clock_gettime(CLOCK_REALTIME, &startTime) < 0) printError("Error calculate startTime", -1);
 
-        // Calcular fuerzas
         calculateForcesThread(attr);
-
-        // Si hay gráficos, esperar al hilo gráfico (Se pausa el cronómetro)
-        if (graphicsEnabled) {
-            if (clock_gettime(CLOCK_REALTIME, &endTime) < 0)
-                printErrorThread("Error calculate endTime", &tid[attr->id]);
-            s->computTime += getElapsedTime(startTime, endTime);
-            int ret = pthread_barrier_wait(&barrGraphic);
-            if (ret != 0 && ret != PTHREAD_BARRIER_SERIAL_THREAD) printErrorThread("Error barrGraphic", &tid[attr->id]);
-        }
-        if (clock_gettime(CLOCK_REALTIME, &startTime) < 0) printErrorThread("Error calculate endTime", &tid[attr->id]);
-
-        // Mover partículas
         moveParticleNoParam(attr);
-        // Marcar partículas borradas
         markDeletedParticles(attr);
 
         //Acaba de contar
-        if (clock_gettime(CLOCK_REALTIME, &endTime) < 0) printErrorThread("Error calculate endTime", &tid[attr->id]);
+        if (clock_gettime(CLOCK_REALTIME, &endTime) < 0) printError("Error calculate endTime", -1);
         s->computTime += getElapsedTime(startTime, endTime);
-
         if (count % M == 0) {
             s->totalComputTime += s->computTime;
             addToGlobalStats(&attr->stats);
         }
-
-        // Esperamos a que todos hayan sumados sus estadísticas para acabar los cálculos
         int ret = pthread_barrier_wait(&barr);
-        if (ret != 0 && ret != PTHREAD_BARRIER_SERIAL_THREAD) printErrorThread("Error barrier Thread", &tid[attr->id]);
-
+        if (ret != 0 && ret != PTHREAD_BARRIER_SERIAL_THREAD) {
+            //Cancelar threads
+        }
         if (count % M == 0) {
-            // Cálculo del desbalance
             double averageBalance = global.computTime / nThread;
-            double ratio = (s->computTime - averageBalance) / averageBalance;
-            s->loadImbalance = ratio;
+            s->loadImbalance = s->computTime - averageBalance;
             pthread_mutex_lock(&mutexStats);
-            if (ratio > global.loadImbalance) global.loadImbalance = ratio;
+            global.loadImbalance += s->loadImbalance;
             printPartialStatistics(attr);
             printed++;
             pthread_cond_signal(&varCond);
             pthread_mutex_unlock(&mutexStats);
         }
-        //Esperar a que el hilo principal acabe para tener la variable "count" actualizada
-        if (sem_wait(&semIter) < 0) printErrorThread("Error semIter Thread", &tid[attr->id]);;
-        if (count % M == 0) s->computTime = 0;
+        sem_wait(&semIter);
+        if (count % M == 0) {
+            s->computTime = 0;
+        }
     }
 }
 
 void sem_post_n(sem_t *sem, int n) {
     for (int i = 0; i < n; ++i) {
-        if (sem_post(sem) == -1) {
-            cancelRemainingThreads(0, nThread);
-            printError("Error semPost", -1);
-        }
+        sem_post(sem);
     }
 }
 
@@ -765,14 +735,14 @@ void loadBalancingGive(int i, double ratio, bool *done) {
             imbalanceRight = rightDifference /
                              fabs((attrs[i].stats.computTime + attrs[right].stats.computTime) / 2);
     }
-    printf("Imbalance left: %f, Imbalance Right: %f\n", imbalanceLeft, imbalanceRight);
     if (imbalanceLeft == 0 && imbalanceRight == 0) return;
 
-    int particlesToGive = ceil((ratio) * (attrs[i].numParts));
+    int particlesToGive = floor((ratio) * (attrs[i].numParts));
     int toGiveLeft = floor(particlesToGive * (imbalanceLeft / (imbalanceLeft + imbalanceRight)));
     int toGiveRight = floor(particlesToGive * (imbalanceRight / (imbalanceLeft + imbalanceRight)));
 
     if (toGiveLeft + toGiveRight >= attrs[i].numParts) return;
+
     if (toGiveLeft == 0 && toGiveRight == 0) return;
     *done = true;
 
@@ -819,15 +789,21 @@ void loadBalancingTake(int i, double ratio, bool *done) {
     }
     if (imbalanceLeft == 0 && imbalanceRight == 0) return;
 
-    int particlesToTake = ceil((ratio) * (attrs[i].numParts));
-    int toTakeLeft = floor(particlesToTake * (imbalanceLeft / (imbalanceLeft + imbalanceRight)));
-    int toTakeRight = floor(particlesToTake * (imbalanceRight / (imbalanceLeft + imbalanceRight)));
+    double percentToTakeLeft = ratio * (imbalanceLeft / (imbalanceLeft + imbalanceRight));
+    double percentToTakeRight = ratio * (imbalanceRight / (imbalanceLeft + imbalanceRight));
 
-    if (toTakeLeft >= attrs[left].numParts) toTakeLeft = floor(attrs[left].numParts * 0.5);
-    if (toTakeRight >= attrs[right].numParts) toTakeRight = floor(attrs[right].numParts * 0.5);
+//    int particlesToTake = floor((ratio) * (attrs[i].numParts));
+    int toTakeLeft = floor(attrs[left].numParts * percentToTakeLeft);
+    int toTakeRight = floor(attrs[right].numParts * percentToTakeRight);
+
+    if (toTakeLeft >= attrs[left].numParts) toTakeLeft = 0;
+    if (toTakeRight >= attrs[right].numParts) toTakeRight = 0;
+
 
     if (toTakeLeft == 0 && toTakeRight == 0) return;
+
     *done = true;
+
 
     printf("%sThread %i LoadBalancing TAKE Iter %i ## "
            "Part: %i [%i-%i]\tUnbalance: %.2f%%\t"
@@ -856,25 +832,27 @@ void loadBalancingTake(int i, double ratio, bool *done) {
 
 
 #ifdef D_GLFW_SUPPORT
-void graphicThread(GLFWwindow *window) {
-    while (count <= steps) {
-        if (sem_wait(&semTree) == -1) stopThread(&tid_graphic);
-        glfwMakeContextCurrent(window);
-        glfwSwapInterval(1);
-        glClear(GL_COLOR_BUFFER_BIT);
+void graphicThread(GLFWwindow *window){
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(1);
 
-        //This is only for visualization
-        drawBarnesHutDivisions(tree);
-        for (int k = 0; k < nShared; k++) drawParticle(sharedBuff, radius, indexes[k]);
+    glClear(GL_COLOR_BUFFER_BIT);
 
-        glfwSwapBuffers(window);
-        glfwPollEvents();
+//            SaveGalaxy(count, nShared, indexes, sharedBuff);
 
-        int ret = pthread_barrier_wait(&barrGraphic);
-        if (ret != 0 && ret != PTHREAD_BARRIER_SERIAL_THREAD) stopThread(&tid_graphic);
-        if (sem_wait(&semIter) == -1) stopThread(&tid_graphic);
+    //This is only for visualization
+    drawBarnesHutDivisions(tree);
+    for(int k=0;k<nShared;k++){
+        drawParticle(sharedBuff,radius,indexes[k]);
     }
 
+//    t=glfwGetTime()-t;
+//    if(t<0.013){
+//        usleep(1000*1000*(0.013-t));
+//    }
+
+    glfwSwapBuffers(window);
+    glfwPollEvents();
 }
 #endif
 
@@ -910,13 +888,15 @@ void firstAssignation() {
 
 void applyBalancingPolicy() {
     bool lastDidGive = false, lastDidTake = false, iDidTake = false, iDidGive = false;
-    for (int i = 0; i < nThread; i++) {
-        double imbalanceRatio = attrs[i].stats.loadImbalance;
+    for (int i = 0; i < nThread; ++i) {
+        double averageTime = global.computTime / nThread;
+        double imbalanceRatio = attrs[i].stats.loadImbalance / averageTime;
         printf("Thread %i\tImbalance: %f\tImbalance percent: %.4f%%\n", i, attrs[i].stats.loadImbalance,
                imbalanceRatio * 100);
         if (!lastDidTake && imbalanceRatio > threshold && attrs[i].numParts > 1)
             loadBalancingGive(i, imbalanceRatio, &iDidGive);
         else if (!lastDidGive && imbalanceRatio < -threshold) loadBalancingTake(i, -imbalanceRatio, &iDidTake);
+
         lastDidGive = iDidGive;
         lastDidTake = iDidTake;
         iDidGive = false;
@@ -924,22 +904,7 @@ void applyBalancingPolicy() {
     }
 }
 
-void stopProgram() {
-    for (int i = 0; i < nThread; i++) {
-        if (tid[i] != -1) {
-            pthread_cancel(tid[i]);
-            pthread_join(tid[i], NULL);
-        }
-    }
-    if (tid_graphic != -1) {
-        pthread_cancel(tid_graphic);
-        pthread_join(tid_graphic, NULL);
-    }
-    freeMemory();
-}
-
 int main(int argc, char *argv[]) {
-    signal(SIGUSR1, stopProgram);
     checkHelpMode(argc, argv);
     struct timespec startTime, endTime;
     if (clock_gettime(CLOCK_REALTIME, &startTime) < 0) printError("Error calculate program startTime", -1);
@@ -985,26 +950,16 @@ int main(int argc, char *argv[]) {
     count = 1;
     //If we need to visualize
 
-    if ((pthread_barrier_init(&barr, NULL, nThread + 1)) < 0) printError("Error creating barrier", -1);
-    if (sem_init(&semTree, 0, 0) < 0) printError("Error creating semTree", -1);
-    if (sem_init(&semIter, 0, 0) < 0) printError("Error creating semIter", -1);
-    if (pthread_mutex_init(&mutexStats, NULL) != 0) printError("Error creating mutexStats", -1);
-    if (pthread_mutex_init(&mutexElminated, NULL) != 0) printError("Error creating mutexEliminated", -1);
-    if (pthread_cond_init(&varCond, NULL))printError("Error creating varCond", -1);
-
-    //Asignación proporcional
-    firstAssignation();
-
 #ifdef D_GLFW_SUPPORT
-    if (graphicsEnabled) {
+    if(graphicsEnabled){
         //If you only care about the algorithm, skip until next comment
-        if (!glfwInit()) {
-            printf("Failed to start GLFW/NBody_BarnesHut-Concurrente");
+        if(!glfwInit()){
+            printf("Failed to start GLFW\NBody_BarnesHut-Concurrente");
             return -1;
         }
-        GLFWwindow *window = glfwCreateWindow(WIDTH, HEIGHT, "Simulation", NULL, NULL);
-        if (!window) {
-            printf("Failed to open window/NBody_BarnesHut-Concurrente");
+        GLFWwindow *window = glfwCreateWindow(WIDTH,HEIGHT,"Simulation",NULL,NULL);
+        if(!window){
+            printf("Failed to open window\NBody_BarnesHut-Concurrente");
             return -1;
         }
         glfwMakeContextCurrent(window);
@@ -1012,58 +967,89 @@ int main(int argc, char *argv[]) {
 
         glMatrixMode(GL_PROJECTION);
         glLoadIdentity();
-        glOrtho(0, 1, 0, 1, 0, 1);
+        glOrtho(0,1,0,1,0,1);
         glMatrixMode(GL_MODELVIEW);
 
-        if ((pthread_barrier_init(&barrGraphic, NULL, nThread + 1)) < 0) printError("Error creating barrier", -1);
-
-        if (pthread_create(&tid_graphic, NULL, (void *(*)(void *)) graphicThread, window) != 0) {
-            printError("Error graphic Thread", -1);
-        }
-
-        while (!glfwWindowShouldClose(window) && count <= steps) {
-            memset(&global, 0, sizeof(global));
-            nShared = nLocal;
-            //First we build the tree
+        while(!glfwWindowShouldClose(window) && count<=steps){
             buildTreeConc(tree, indexes, nLocal, nThread);
-            sem_post_n(&semTree, nThread + 1);
-            // Barrera
-            int ret = pthread_barrier_wait(&barr);
-            if (ret != 0 && ret != PTHREAD_BARRIER_SERIAL_THREAD) cancelRemainingThreads(0, nThread);
+            pthread_create(&tid[nThread-1], NULL, (void *(*)(void *)) graphicThread, window);
+
+            if (nShared == nLocal && count > 1) {
+                for (int j = 0; j < nThread - 1; j++) {
+                    if (pthread_create(&tid[j], NULL, (void *(*)(void *)) calculateForcesThread, &attrs[j]) != 0) {
+                        cancelRemainingThreads(0, j);
+                        printError("ERROR CREATE", -3);
+                    }
+                }
+                calculateForcesThread(&attrs[nThread - 1]);
+            } else {
+                nShared = nLocal;
+                int firstNonAssigned = 0, currentJob = 0, remainingThreads = nThread, tasks = nLocal;
+                for (int j = 0; j < nThread - 1; j++) {
+                    currentJob = tasks / remainingThreads;
+                    attrs[j].first = firstNonAssigned;
+                    attrs[j].last = firstNonAssigned + currentJob;
+                    if (pthread_create(&tid[j], NULL, (void *(*)(void *)) calculateForcesThread, &attrs[j]) != 0) {
+                        cancelRemainingThreads(0, j);
+                        printError("ERROR CREATE", -1);
+                    }
+                    firstNonAssigned += currentJob; //Maybe attrs[j].last
+                    remainingThreads--;
+                    tasks -= currentJob;
+                }
+                attrs[nThread - 1].first = firstNonAssigned;
+                attrs[nThread - 1].last = firstNonAssigned + tasks;
+                calculateForcesThread(&attrs[nThread - 1]);
+            }
+            for (int i = 0; i < nThread; i++) {
+                if (pthread_join(tid[i], NULL) != 0) {
+                    cancelRemainingThreads(i, nThread);
+                    printError("ERROR JOIN", -2);
+                }
+            }
+
+            // Move particles
+            for (int j = 0; j < nThread - 1; j++) {
+                if (pthread_create(&tid[j], NULL, (void *(*)(void *)) moveParticleNoParam, &attrs[j]) != 0) {
+                    cancelRemainingThreads(0, j);
+                    printError("ERROR CREATE", -3);
+                }
+            }
+            moveParticleNoParam(&attrs[nThread-1]);
+            for (int i = 0; i < nThread-1; i++) {
+                if (pthread_join(tid[i], NULL) != 0) {
+                    cancelRemainingThreads(i, nThread);
+                    printError("ERROR JOIN", -4);
+                }
+            }
 
             // Kick out particle if it went out of the box (0,1)x(0,1)
-            if (eliminated) kickParticles();
+            kickParticles();
 
             //To be able to store the positions of the particles
-            ShowWritePartialResults(count, nOriginal, nLocal, indexes, sharedBuff, startTime);
-
-            if (eliminated) reassignParticles();
-
-            if (count % M == 0) {
-                pthread_mutex_lock(&mutexStats);
-                while (printed < nThread) pthread_cond_wait(&varCond, &mutexStats);
-                printf("\n");
-                applyBalancingPolicy();
-                printf("\n");
-                totalImbalance += global.loadImbalance;
-                printGlobalStatistics();
-                pthread_mutex_unlock(&mutexStats);
-            }
+            ShowWritePartialResults(count, nOriginal, nLocal, indexes, sharedBuff);
             //We advance one step
             count++;
-            printed = 0;
-            eliminated = false;
-            sem_post_n(&semIter, nThread + 1);
-        }
-        if (pthread_join(tid_graphic, NULL) != 0) {
-            cancelRemainingThreads(0, nThread);
-            printError("Error Join", -1);
         }
         glfwTerminate();
     } else {
 #endif
     //This is the pure algorithm, without visualization
     //system("mkdir res");
+
+    if ((pthread_barrier_init(&barr1, NULL, nThread + 1)) < 0) printError("Error creating barrier", -1);
+    if ((pthread_barrier_init(&barr, NULL, nThread + 1)) < 0) printError("Error creating barrier", -1);
+    if (sem_init(&semTree, 0, 0) < 0) printError("Error creating semTree", -1);
+    if (sem_init(&semIter, 0, 0) < 0) printError("Error creating semIter", -1);
+    if (pthread_mutex_init(&mutexStats, NULL) != 0) printError("Error creating mutexStats", -1);
+    if (pthread_mutex_init(&mutexElminated, NULL) != 0) printError("Error creating mutexEliminated", -1);
+    if (pthread_cond_init(&varCond, NULL))printError("Error creating varCond", -1);
+
+    count = 1;
+
+    //Asignación proporcional
+    firstAssignation();
+
 
     while (count <= steps) {
         memset(&global, 0, sizeof(global));
@@ -1086,7 +1072,9 @@ int main(int argc, char *argv[]) {
         if (count % M == 0) {
             pthread_mutex_lock(&mutexStats);
             while (printed < nThread) pthread_cond_wait(&varCond, &mutexStats);
+            printf("\n");
             applyBalancingPolicy();
+            printf("\n");
             printGlobalStatistics();
             pthread_mutex_unlock(&mutexStats);
         }
@@ -1100,24 +1088,21 @@ int main(int argc, char *argv[]) {
 #ifdef D_GLFW_SUPPORT
     }
 #endif
-    count--;
     for (int i = 0; i < nThread; ++i) {
         if (pthread_join(tid[i], NULL) != 0) {
             cancelRemainingThreads(i, nThread);
             printError("Error Join", -1);
         }
     }
-
-    for (int i = 0; i < nThread; ++i) printPartialStatistics(&attrs[i]);
-    printGlobalStatistics();
-
     if (clock_gettime(CLOCK_REALTIME, &endTime) < 0) printError("Error calculate program endTime", -1);
     TimeSpent = getElapsedTime(startTime, endTime);
     printf("NBody Simulation took %.3f seconds.\n", TimeSpent);
 
-    // Save final state.
-    sprintf(filename, "./res/galaxy_%dB_%di_final.out", nOriginal, count);
+// Save final state.
+    sprintf(filename, "./res/galaxy_%dB_%di_final.out", nOriginal, count - 1);
     SaveGalaxyFile(filename, nLocal, indexes, sharedBuff);
     freeMemory();
     return 0;
 }
+
+
