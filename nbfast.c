@@ -68,7 +68,7 @@ struct Node *tree;
 pthread_t *tid;
 
 sem_t semTree, semIter;
-pthread_barrier_t barr1, barr2;
+pthread_barrier_t barr1, barr;
 pthread_mutex_t mutexStats, mutexElminated;
 pthread_cond_t varCond;
 
@@ -76,6 +76,7 @@ pthread_cond_t varCond;
 bool graphicsEnabled = false;
 bool inputFile = false;
 bool eliminated = false;
+int printed = 0;
 
 void printPrueba(char *msg) {
     if (DEBUG) fprintf(stderr, "%s\n", msg);
@@ -128,7 +129,7 @@ void freeMemory() {
     free(radius);
 
     pthread_barrier_destroy(&barr1);
-    pthread_barrier_destroy(&barr2);
+    pthread_barrier_destroy(&barr);
     sem_destroy(&semTree);
     sem_destroy(&semIter);
     pthread_mutex_destroy(&mutexStats);
@@ -691,19 +692,19 @@ void threadRoutine(struct Partition *attr) {
             s->totalComputTime += s->computTime;
             addToGlobalStats(&attr->stats);
         }
-        int ret = pthread_barrier_wait(&barr2);
+        int ret = pthread_barrier_wait(&barr);
         if (ret != 0 && ret != PTHREAD_BARRIER_SERIAL_THREAD) {
             //Cancelar threads
         }
-        double averageBalance = global.computTime / nThread;
-        s->loadImbalance = s->computTime - averageBalance;
-        pthread_mutex_lock(&mutexStats);
-        global.loadImbalance += s->loadImbalance;
-        pthread_mutex_unlock(&mutexStats);
-        if (count % M == 0) printPartialStatistics(attr);
-        ret = pthread_barrier_wait(&barr1);
-        if (ret != 0 && ret != PTHREAD_BARRIER_SERIAL_THREAD) {
-            //Cancelar threads
+        if (count % M == 0) {
+            double averageBalance = global.computTime / nThread;
+            s->loadImbalance = s->computTime - averageBalance;
+            pthread_mutex_lock(&mutexStats);
+            global.loadImbalance += s->loadImbalance;
+            printPartialStatistics(attr);
+            printed++;
+            pthread_cond_signal(&varCond);
+            pthread_mutex_unlock(&mutexStats);
         }
         sem_wait(&semIter);
         if (count % M == 0) {
@@ -724,18 +725,21 @@ void loadBalancingGive(int i, double ratio, bool *done) {
     int right = i + 1;
     if (i != 0) {
         double leftDifference = attrs[i].stats.computTime - attrs[left].stats.computTime;
-        if (leftDifference > 0) imbalanceLeft = leftDifference /
-                                                fabs((attrs[i].stats.computTime + attrs[left].stats.computTime) / 2);
+        if (leftDifference > 0)
+            imbalanceLeft = leftDifference /
+                            fabs((attrs[i].stats.computTime + attrs[left].stats.computTime) / 2);
     }
     if (i != nThread - 1) {
         double rightDifference = attrs[i].stats.computTime - attrs[right].stats.computTime;
-        if (rightDifference > 0) imbalanceRight = rightDifference / fabs((attrs[i].stats.computTime + attrs[right].stats.computTime) / 2);
+        if (rightDifference > 0)
+            imbalanceRight = rightDifference /
+                             fabs((attrs[i].stats.computTime + attrs[right].stats.computTime) / 2);
     }
     if (imbalanceLeft == 0 && imbalanceRight == 0) return;
 
     int particlesToGive = floor((ratio) * (attrs[i].numParts));
     int toGiveLeft = floor(particlesToGive * (imbalanceLeft / (imbalanceLeft + imbalanceRight)));
-    int toGiveRight = particlesToGive - toGiveLeft;
+    int toGiveRight = floor(particlesToGive * (imbalanceRight / (imbalanceLeft + imbalanceRight)));
 
     if (toGiveLeft + toGiveRight >= attrs[i].numParts) return;
 
@@ -773,20 +777,26 @@ void loadBalancingTake(int i, double ratio, bool *done) {
     int right = i + 1;
     if (i != 0) {
         double leftDifference = attrs[left].stats.computTime - attrs[i].stats.computTime;
-        if (leftDifference > 0) imbalanceLeft = leftDifference / attrs[left].stats.computTime;
+        if (leftDifference > 0)
+            imbalanceLeft = leftDifference /
+                            fabs((attrs[i].stats.computTime + attrs[left].stats.computTime) / 2);
     }
     if (i != nThread - 1) {
         double rightDifference = attrs[right].stats.computTime - attrs[i].stats.computTime;
-        if (rightDifference > 0) imbalanceRight = rightDifference / attrs[right].stats.computTime;
+        if (rightDifference > 0)
+            imbalanceRight = rightDifference /
+                             fabs((attrs[i].stats.computTime + attrs[right].stats.computTime) / 2);
     }
     if (imbalanceLeft == 0 && imbalanceRight == 0) return;
 
     int particlesToTake = floor((ratio) * (attrs[i].numParts));
     int toTakeLeft = floor(particlesToTake * (imbalanceLeft / (imbalanceLeft + imbalanceRight)));
-    int toTakeRight = particlesToTake - toTakeLeft;
+    int toTakeRight = floor(particlesToTake * (imbalanceRight / (imbalanceLeft + imbalanceRight)));
 
-    if (toTakeLeft >= attrs[left].numParts) toTakeLeft = 0;
-    if (toTakeRight >= attrs[right].numParts) toTakeRight = 0;
+    if (toTakeLeft >= attrs[left].numParts) toTakeLeft = floor(attrs[left].numParts * 0.5);
+    if (toTakeRight >= attrs[right].numParts) toTakeRight = floor(attrs[right].numParts * 0.5);
+
+
     if (toTakeLeft == 0 && toTakeRight == 0) return;
 
     *done = true;
@@ -870,6 +880,24 @@ void firstAssignation() {
         firstNonAssigned += currentJob; //Maybe attrs[j].last
         remainingThreads--;
         tasks -= currentJob;
+    }
+}
+
+void applyBalancingPolicy() {
+    bool lastDidGive = false, lastDidTake = false, iDidTake = false, iDidGive = false;
+    for (int i = 0; i < nThread; ++i) {
+        double averageTime = global.computTime / nThread;
+        double imbalanceRatio = attrs[i].stats.loadImbalance / averageTime;
+        printf("Thread %i\tImbalance: %f\tImbalance percent: %.4f%%\n", i, attrs[i].stats.loadImbalance,
+               imbalanceRatio * 100);
+        if (!lastDidTake && imbalanceRatio > threshold && attrs[i].numParts > 1)
+            loadBalancingGive(i, imbalanceRatio, &iDidGive);
+        else if (!lastDidGive && imbalanceRatio < -threshold) loadBalancingTake(i, -imbalanceRatio, &iDidTake);
+
+        lastDidGive = iDidGive;
+        lastDidTake = iDidTake;
+        iDidGive = false;
+        iDidTake = false;
     }
 }
 
@@ -1007,11 +1035,12 @@ int main(int argc, char *argv[]) {
     //system("mkdir res");
 
     if ((pthread_barrier_init(&barr1, NULL, nThread + 1)) < 0) printError("Error creating barrier", -1);
-    if ((pthread_barrier_init(&barr2, NULL, nThread + 1)) < 0) printError("Error creating barrier", -1);
+    if ((pthread_barrier_init(&barr, NULL, nThread + 1)) < 0) printError("Error creating barrier", -1);
     if (sem_init(&semTree, 0, 0) < 0) printError("Error creating semTree", -1);
     if (sem_init(&semIter, 0, 0) < 0) printError("Error creating semIter", -1);
     if (pthread_mutex_init(&mutexStats, NULL) != 0) printError("Error creating mutexStats", -1);
     if (pthread_mutex_init(&mutexElminated, NULL) != 0) printError("Error creating mutexEliminated", -1);
+    if (pthread_cond_init(&varCond, NULL))printError("Error creating varCond", -1);
 
     count = 1;
 
@@ -1026,7 +1055,7 @@ int main(int argc, char *argv[]) {
         buildTreeConc(tree, indexes, nLocal, nThread);
         sem_post_n(&semTree, nThread);
         // Barrera
-        int ret = pthread_barrier_wait(&barr2);
+        int ret = pthread_barrier_wait(&barr);
         if (ret != 0 && ret != PTHREAD_BARRIER_SERIAL_THREAD) cancelRemainingThreads(0, nThread);
 
         // Kick out particle if it went out of the box (0,1)x(0,1)
@@ -1037,31 +1066,18 @@ int main(int argc, char *argv[]) {
 
         if (eliminated) reassignParticles();
 
-        ret = pthread_barrier_wait(&barr1);
-        if (ret != 0 && ret != PTHREAD_BARRIER_SERIAL_THREAD) cancelRemainingThreads(0, nThread);
-
         if (count % M == 0) {
+            pthread_mutex_lock(&mutexStats);
+            while (printed < nThread) pthread_cond_wait(&varCond, &mutexStats);
             printf("\n");
-            bool lastDidGive = false, lastDidTake = false, iDidTake = false, iDidGive = false;
-            for (int i = 0; i < nThread; ++i) {
-                double averageTime = global.computTime / nThread;
-                double imbalanceRatio = attrs[i].stats.loadImbalance / averageTime;
-                printf("Thread %i\tImbalance: %f\tImbalance percent: %.4f%%\n", i, attrs[i].stats.loadImbalance,
-                       imbalanceRatio * 100);
-                if (!lastDidTake && imbalanceRatio > threshold && attrs[i].numParts > 1)
-                    loadBalancingGive(i, imbalanceRatio, &iDidGive);
-                else if (!lastDidGive && imbalanceRatio < -threshold) loadBalancingTake(i, -imbalanceRatio, &iDidTake);
-
-                lastDidGive = iDidGive;
-                lastDidTake = iDidTake;
-                iDidGive = false;
-                iDidTake = false;
-            }
+            applyBalancingPolicy();
             printf("\n");
             printGlobalStatistics();
+            pthread_mutex_unlock(&mutexStats);
         }
         //We advance one step
         count++;
+        printed = 0;
         eliminated = false;
         sem_post_n(&semIter, nThread);
     }
