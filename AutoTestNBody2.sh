@@ -1,7 +1,7 @@
 #!/bin/bash
 
-PARTICLES=("100" "1000" "5000" "10000" "25000" "100000")
-ITERATIONS=("1000" "1000" "1000" "100" "25" "10")
+PARTICLES=("100" "1000" "5000" "10000" "25000")
+ITERATIONS=("1000" "1000" "1000" "100" "25")
 OUTPUT_FILE="AutoTestNBody_Output.txt"
 
 TIMES=()
@@ -33,7 +33,7 @@ execSequentialMode() {
   timeSeq=$( (time ./NBody_BarnesHut/NBody_GUI 1 "${ITERATIONS[i]}" ./NBody_BarnesHut/Test/"$filename" $graphics) 2>&1 >/dev/null |
     awk '/^real/{print $2}')
   printf "\tTiempo: %s\n" "$timeSeq"
-  TIMES[1]=$timeConc
+  TIMES[1]=$timeSeq
 }
 
 execConcurrentMode() {
@@ -63,11 +63,11 @@ for i in {0..5}; do
 
   execSequentialMode
 
-  execConcurrentMode "NBody" 4
+  execConcurrentMode "NBody_GUI" 4
 
-  execConcurrentMode "NBody" 8
+  execConcurrentMode "NBody_GUI" 8
 
-  execConcurrentMode "NBody" 16
+  execConcurrentMode "NBody_GUI" 16
 
   printLine "$filename" "${TIMES[1]}" "${TIMES[4]}" "${PASSED[4]}" "${TIMES[8]}" "${PASSED[8]}" "${TIMES[16]}" "${PASSED[16]}"
 done
