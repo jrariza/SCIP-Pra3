@@ -949,31 +949,7 @@ void joinThreads() {
     if (graphicsEnabled) if (pthread_join(tid_graphic, NULL) != 0) printError("Error Join", -1);
 }
 
-int main(int argc, char *argv[]) {
-    signal(SIGUSR1, stopProgram);
-    checkHelpMode(argc, argv);
-    struct timespec startTime, endTime;
-    if (clock_gettime(CLOCK_REALTIME, &startTime) < 0) printError("Error calculate program startTime", -1);
-    memset(&global, 0, sizeof(global));
-
-    // Overwrite default values if they are passed as arguments.
-    initializeArgs(argc, argv);
-
-    attrs = (struct Partition *) malloc(sizeof(struct Partition) * nThread);
-    tid = (pthread_t *) malloc(sizeof(pthread_t) * (nThread));
-
-    if (attrs == NULL || tid == NULL) printError("Error Malloc", -1);
-
-    srand(time(NULL));
-
-    if (inputFile && access(filename, F_OK) == 0) {
-        /* Read bodies initial state from file */
-        ReadGalaxyFileOptimized(filename);
-    } else {
-        initializeRandomParticles();
-    }
-    printInputArgs(nShared, steps, nThread, filename);
-
+void initializeTree() {
     //This is the main node, the one that holds the first four children nodes that make the calculation zone
     tree = malloc(sizeof *tree);
     if (tree == NULL) printError("Error Malloc", -1);
@@ -989,6 +965,30 @@ int main(int argc, char *argv[]) {
     //The coordinates of the geometric center of the node in x and y
     tree->GCX = 0.5;
     tree->GCY = 0.5;
+}
+
+int main(int argc, char *argv[]) {
+    // Señal para que los hilos avisen al hilo principal de que se ha producido un error y se debe finalizar el programa.
+    signal(SIGUSR1, stopProgram);
+    checkHelpMode(argc, argv);
+    struct timespec startTime, endTime;
+    if (clock_gettime(CLOCK_REALTIME, &startTime) < 0) printError("Error calculate program startTime", -1);
+    // Overwrite default values if they are passed as arguments.
+    initializeArgs(argc, argv);
+
+    attrs = (struct Partition *) malloc(sizeof(struct Partition) * nThread);
+    tid = (pthread_t *) malloc(sizeof(pthread_t) * (nThread));
+
+    if (attrs == NULL || tid == NULL) printError("Error Malloc", -1);
+
+    srand(time(NULL));
+
+    if (inputFile && access(filename, F_OK) == 0) ReadGalaxyFileOptimized(filename);
+    else initializeRandomParticles();
+
+    printInputArgs(nShared, steps, nThread, filename);
+
+    initializeTree();
 
     // Save initial state.
     sprintf(filename, "./res/galaxy_%dB_initial.out", nOriginal);
@@ -1006,6 +1006,7 @@ int main(int argc, char *argv[]) {
 
     //Asignación proporcional
     firstAssignation();
+    memset(&global, 0, sizeof(global));
 
 #ifdef D_GLFW_SUPPORT
     if (graphicsEnabled) {
@@ -1034,7 +1035,6 @@ int main(int argc, char *argv[]) {
         }
 
         while (!glfwWindowShouldClose(window) && count <= steps) {
-            memset(&global, 0, sizeof(global));
             //First we build the tree
             buildTreeConc(tree, indexes, nLocal, nThread);
             sem_post_n(&semTree, nThread + 1);
@@ -1063,7 +1063,6 @@ int main(int argc, char *argv[]) {
             eliminated = false;
             if (count % M == 0) memset(&global, 0, sizeof(global));
             sem_post_n(&semIter, nThread+1);
-
         }
         glfwTerminate();
     } else {
@@ -1072,7 +1071,6 @@ int main(int argc, char *argv[]) {
     //system("mkdir res");
 
     while (count <= steps) {
-        nShared = nLocal;
         //First we build the tree
         buildTreeConc(tree, indexes, nLocal, nThread);
         sem_post_n(&semTree, nThread);
